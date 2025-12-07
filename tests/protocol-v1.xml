@@ -46,6 +46,16 @@
 
   </object>
 
+  <enum name="my_enum">
+    <value idx="0" name="hello"/>
+    <value idx="4" name="world"/>
+  </enum>
+
+  <enum name="my_error_enum">
+    <value idx="0" name="oh_no"/>
+    <value idx="1" name="error_important" description="important error!!"/>
+  </enum>
+
   <object name="my_object_v1" version="1">
     <description summary="test object">
       This object is an example object for the protocol
@@ -63,6 +73,13 @@
             Sends a text message to the server
       </description>
       <arg name="message" type="varchar" summary="message"/>
+    </c2s>
+
+    <c2s name="send_enum">
+      <description summary="Send an enum message">
+            Sends an enum message to the server
+      </description>
+      <arg name="message" type="enum" interface="my_enum" summary="message"/>
     </c2s>
 
     <c2s name="destroy" destructor="true">
