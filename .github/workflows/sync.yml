@@ -1,0 +1,45 @@
+name: Sync from Debian Salsa
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Runs daily at midnight.
+  workflow_dispatch: # Allows you to run it manually
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout My Repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MY_GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch from Salsa
+        run: |
+          # Add the Salsa repo as a remote
+          git remote add upstream https://salsa.debian.org/hyprland-team/hyprwire.git
+          git fetch upstream master # Using 'master' as Salsa often uses it; change to 'main' if needed
+
+      - name: Merge and Remove README
+        run: |
+          # Merge upstream changes into your current branch
+          # '--allow-unrelated-histories' is used if the repos weren't originally forked
+          git merge upstream/master --allow-unrelated-histories -m "Sync from Salsa" || true
+          
+          # Force the README.md to stay as YOUR version (or delete it)
+          # We check out your version of the README from the previous commit
+          git checkout HEAD~1 -- README.md || echo "README not found, skipping"
+          
+          # If there are changes (like the README being restored), commit them
+          git add README.md
+          git commit -m "Restore local README after sync" || echo "No changes to README"
+
+      - name: Push to GitHub
+        run: |
+          git push origin main
