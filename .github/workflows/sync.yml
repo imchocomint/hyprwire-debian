@@ -25,16 +25,24 @@ jobs:
           git remote add upstream https://salsa.debian.org/hyprland-team/hyprwire.git
           git fetch upstream
           
-          # Merge the source code branch from Salsa
-          # We use upstream/upstream/latest based on your specific log output
-          git merge upstream/upstream/latest --allow-unrelated-histories -m "Sync from Salsa"
+          # 1. Start the merge but don't commit it yet
+          # This allows us to fix conflicts in the script
+          git merge upstream/upstream/latest --allow-unrelated-histories --no-commit --no-ff || true
 
-      - name: Restore Local README
-        run: |
-          # This brings back your version of the README from before the merge
-          git checkout HEAD~1 -- README.md || echo "README not found, skipping"
-          git add README.md
-          git commit -m "Keep local README" || echo "No changes to README"
+          # 2. Resolve README conflict: Keep YOUR version
+          # 'HEAD' refers to your repo's version
+          git checkout --ours README.md
+          
+          # 3. Resolve LICENSE conflict: Usually best to keep yours or combine them
+          # Using --ours keeps your existing license
+          git checkout --ours LICENSE
+          
+          # 4. Add all other changes from Salsa (the code)
+          git add .
+
+          # 5. Finalize the merge commit
+          git commit -m "Sync from Salsa: Merged upstream code and preserved local README/LICENSE"
+
       - name: Push to GitHub
         run: |
           git push origin main
