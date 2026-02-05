@@ -1,6 +1,7 @@
 #include <hyprwire/hyprwire.hpp>
 #include <print>
 #include <sys/signal.h>
+#include <unistd.h>
 
 #include "generated/test_protocol_v1-server.hpp"
 
@@ -16,15 +17,31 @@ static SP<CTestProtocolV1Impl>     spec  = makeShared<CTestProtocolV1Impl>(1, []
     std::println("Object bound XD");
     manager = makeShared<CMyManagerV1Object>(std::move(obj));
 
-    manager->sendSendMessage("Hello object");
+    manager->sendSendMessage("Hello manager");
     manager->setSendMessage([](const char* msg) { std::println("Recvd message: {}", msg); });
+    manager->setSendMessageFd([](int fd) {
+        char msgbuf[6] = {0};
+        sc<void>(read(fd, msgbuf, 5));
+        std::println("Recvd fd {} with data: {}", fd, msgbuf);
+    });
+    manager->setSendMessageArrayFd([](const std::vector<int>& fds) {
+        std::println("Received {} fds", fds.size());
+    
+        for (int fd : fds) {
+            char msgbuf[8] = {0};
+            sc<void>(read(fd, msgbuf, 7));
+            std::println("fd {} with data: {}", fd, msgbuf);
+        }
+    });
     manager->setSendMessageArray([](std::vector<const char*> data) {
         std::string conct = "";
         for (const auto& d : data) {
             conct += d + std::string{", "};
         }
-        conct.pop_back();
-        conct.pop_back();
+        if (conct.size() > 1) {
+            conct.pop_back();
+            conct.pop_back();
+        }
         std::println("Got array message: \"{}\"", conct);
     });
     manager->setSendMessageArrayUint([](std::vector<uint32_t> data) {
@@ -37,9 +54,9 @@ static SP<CTestProtocolV1Impl>     spec  = makeShared<CTestProtocolV1Impl>(1, []
         std::println("Got uint array message: \"{}\"", conct);
     });
     manager->setMakeObject([](uint32_t seq) {
-        object = makeShared<CMyObjectV1Object>(sock->createObject(manager->getObject()->client(), manager->getObject(), "my_object_v1", seq));
+        object = makeShared<CMyObjectV1Object>(sock->createObject(manager->getObject()->client(), manager->getObject(), CMyObjectV1Object::name(), seq));
         object->sendSendMessage("Hello object");
-        object->setSendMessage([](const char* msg) { std::println("Object says hello"); });
+        object->setSendMessage([](const char* msg) { std::println("Object says hello: {}", msg); });
         object->setSendEnum([](testProtocolV1MyEnum e) {
             std::println("Object sent enum: {}", sc<uint32_t>(e));
 

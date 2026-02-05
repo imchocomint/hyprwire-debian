@@ -13,6 +13,9 @@ namespace Hyprwire {
 
         static Hyprutils::Memory::CSharedPointer<IClientSocket> open(const std::string& path);
 
+        // IClientSocket takes ownership of the fd.
+        static Hyprutils::Memory::CSharedPointer<IClientSocket> open(const int fd);
+
         /*
             Add an implementation to the socket
         */
@@ -47,6 +50,21 @@ namespace Hyprwire {
             Get an object from an id
         */
         virtual Hyprutils::Memory::CSharedPointer<IObject> objectForId(uint32_t id) = 0;
+
+        /*
+            Perform a roundtrip
+        */
+        virtual void roundtrip() = 0;
+
+        /*
+            Check if handshake has been estabilished
+        */
+        virtual bool isHandshakeDone() = 0;
+
+        /*
+            Get an object from a sequence number
+        */
+        virtual Hyprutils::Memory::CSharedPointer<IObject> objectForSeq(uint32_t seq) = 0;
 
       protected:
         IClientSocket() = default;

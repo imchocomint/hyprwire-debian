@@ -1,6 +1,7 @@
 #include <hyprwire/hyprwire.hpp>
 #include <print>
 #include "generated/test_protocol_v1-client.hpp"
+#include <unistd.h>
 
 using namespace Hyprutils::Memory;
 
@@ -16,6 +17,11 @@ static SP<Hyprwire::IClientSocket> sock;
 int                                main(int argc, char** argv, char** envp) {
     const auto XDG_RUNTIME_DIR = getenv("XDG_RUNTIME_DIR");
     sock                       = Hyprwire::IClientSocket::open(XDG_RUNTIME_DIR + std::string{"/test-hw.sock"});
+
+    if (!sock) {
+        std::println("err: failed to open client socket");
+        return 1;
+    }
 
     sock->addImplementation(impl);
 
@@ -37,10 +43,32 @@ int                                main(int argc, char** argv, char** envp) {
 
     std::println("Bound!");
 
+    int pips[2];
+    sc<void>(pipe(pips));
+    sc<void>(write(pips[1], "pipe!", 5));
+
+    std::println("Will send fd {}", pips[0]);
+
+    int pips2[2];
+    int pips3[2];
+    
+    sc<void>(pipe(pips2));
+    sc<void>(pipe(pips3));
+    
+    sc<void>(write(pips2[1], "o kurwa", 7));
+    sc<void>(write(pips3[1], "bober!!", 7));
+
     manager->sendSendMessage("Hello!");
+    manager->sendSendMessageFd(pips[0]);
+    manager->sendSendMessageArrayFd(std::vector<int>{pips2[0], pips3[0]});
     manager->sendSendMessageArray(std::vector<const char*>{"Hello", "via", "array!"});
+    manager->sendSendMessageArray(std::vector<const char*>{});
     manager->sendSendMessageArrayUint(std::vector<uint32_t>{69, 420, 2137});
     manager->setSendMessage([](const char* msg) { std::println("Server says {}", msg); });
+
+    // test roundtrip
+    sock->roundtrip();
+
     object = makeShared<CCMyObjectV1Object>(manager->sendMakeObject());
     object->setSendMessage([](const char* msg) { std::println("Server says on object {}", msg); });
     object->sendSendMessage("Hello on object");

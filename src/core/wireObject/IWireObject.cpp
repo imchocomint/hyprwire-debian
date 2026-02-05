@@ -1,16 +1,19 @@
 #include "IWireObject.hpp"
 
+#include "../../Macros.hpp"
 #include "../../helpers/Log.hpp"
 #include "../../helpers/FFI.hpp"
 #include "../client/ClientObject.hpp"
 #include "../message/MessageType.hpp"
 #include "../message/MessageParser.hpp"
+#include "../message/MessageMagic.hpp"
 #include "../message/messages/GenericProtocolMessage.hpp"
 #include <hyprwire/core/types/MessageMagic.hpp>
 #include <hyprutils/utils/ScopeGuard.hpp>
 
 #include <cstdarg>
 #include <cstring>
+#include <string_view>
 #include <ffi.h>
 
 using namespace Hyprwire;
@@ -21,8 +24,9 @@ IWireObject::~IWireObject() = default;
 uint32_t IWireObject::call(uint32_t id, ...) {
     const auto METHODS = methodsOut();
     if (METHODS.size() <= id) {
-        Debug::log(ERR, "core protocol error: invalid method {} for object {}", id, m_id);
-        errd();
+        const auto MSG = std::format("core protocol error: invalid method {} for object {}", id, m_id);
+        Debug::log(ERR, "core protocol error: {}", MSG);
+        error(m_id, MSG);
         return 0;
     }
 
@@ -33,39 +37,48 @@ uint32_t IWireObject::call(uint32_t id, ...) {
     const auto  params = method.params;
 
     if (method.since > m_version) {
-        Debug::log(ERR, "core protocol error: method {} since {} but has {}", id, method.since, m_version);
-        errd();
+        const auto MSG = std::format("method {} since {} but has {}", id, method.since, m_version);
+        Debug::log(ERR, "core protocol error: {}", MSG);
+        error(m_id, MSG);
         return 0;
     }
 
     if (!method.returnsType.empty() && server()) {
-        Debug::log(ERR, "core protocol error: invalid method spec {} for object {} -> server cannot call returnsType methods", id, m_id);
-        errd();
+        const auto MSG = std::format("invalid method spec {} for object {} -> server cannot call returnsType methods", id, m_id);
+        Debug::log(ERR, "core protocol error: {}", MSG);
+        error(m_id, MSG);
         return 0;
     }
 
     // encode the message
     std::vector<uint8_t> data;
+    std::vector<int>     fds;
     data.emplace_back(HW_MESSAGE_TYPE_GENERIC_PROTOCOL_MESSAGE);
     data.emplace_back(HW_MESSAGE_MAGIC_TYPE_OBJECT);
 
     data.resize(data.size() + 4);
-    *rc<uint32_t*>(&data[data.size() - 4]) = m_id;
+    std::memcpy(&data[data.size() - 4], &m_id, sizeof(m_id));
 
     data.emplace_back(HW_MESSAGE_MAGIC_TYPE_UINT);
 
     data.resize(data.size() + 4);
-    *rc<uint32_t*>(&data[data.size() - 4]) = id;
+    std::memcpy(&data[data.size() - 4], &id, sizeof(id));
 
-    size_t waitOnSeq = 0;
+    size_t returnSeq = 0;
 
     if (!method.returnsType.empty()) {
+        if (Env::isTrace()) {
+            auto selfClient = reinterpretPointerCast<CClientObject>(m_self.lock());
+            TRACE(Debug::log(TRACE, "[{} @ {:.3f}] -- call {}: returnsType has {}", selfClient->m_client->m_fd.get(), steadyMillis(), id, method.returnsType));
+        }
+
         data.emplace_back(HW_MESSAGE_MAGIC_TYPE_SEQ);
 
         data.resize(data.size() + 4);
-        auto selfClient                        = reinterpretPointerCast<CClientObject>(m_self.lock());
-        *rc<uint32_t*>(&data[data.size() - 4]) = ++selfClient->m_client->m_seq;
-        waitOnSeq                              = selfClient->m_client->m_seq;
+        auto     selfClient = reinterpretPointerCast<CClientObject>(m_self.lock());
+        uint32_t seqVal     = ++selfClient->m_client->m_seq;
+        std::memcpy(&data[data.size() - 4], &seqVal, sizeof(seqVal));
+        returnSeq = selfClient->m_client->m_seq;
     }
 
     for (size_t i = 0; i < params.size(); ++i) {
@@ -73,28 +86,32 @@ uint32_t IWireObject::call(uint32_t id, ...) {
             case HW_MESSAGE_MAGIC_TYPE_UINT: {
                 data.emplace_back(HW_MESSAGE_MAGIC_TYPE_UINT);
                 data.resize(data.size() + 4);
-                *rc<uint32_t*>(&data[data.size() - 4]) = va_arg(va, uint32_t);
+                uint32_t val = va_arg(va, uint32_t);
+                std::memcpy(&data[data.size() - 4], &val, sizeof(val));
                 break;
             }
 
             case HW_MESSAGE_MAGIC_TYPE_INT: {
                 data.emplace_back(HW_MESSAGE_MAGIC_TYPE_INT);
                 data.resize(data.size() + 4);
-                *rc<int32_t*>(&data[data.size() - 4]) = va_arg(va, int32_t);
+                int32_t val = va_arg(va, int32_t);
+                std::memcpy(&data[data.size() - 4], &val, sizeof(val));
                 break;
             }
 
             case HW_MESSAGE_MAGIC_TYPE_OBJECT: {
                 data.emplace_back(HW_MESSAGE_MAGIC_TYPE_OBJECT);
                 data.resize(data.size() + 4);
-                *rc<uint32_t*>(&data[data.size() - 4]) = va_arg(va, uint32_t);
+                uint32_t val = va_arg(va, uint32_t);
+                std::memcpy(&data[data.size() - 4], &val, sizeof(val));
                 break;
             }
 
             case HW_MESSAGE_MAGIC_TYPE_F32: {
                 data.emplace_back(HW_MESSAGE_MAGIC_TYPE_F32);
                 data.resize(data.size() + 4);
-                *rc<float*>(&data[data.size() - 4]) = va_arg(va, double);
+                float val = va_arg(va, double);
+                std::memcpy(&data[data.size() - 4], &val, sizeof(val));
                 break;
             }
 
@@ -120,9 +137,16 @@ uint32_t IWireObject::call(uint32_t id, ...) {
                     case HW_MESSAGE_MAGIC_TYPE_INT:
                     case HW_MESSAGE_MAGIC_TYPE_F32:
                     case HW_MESSAGE_MAGIC_TYPE_OBJECT: {
-                        for (size_t i = 0; i < arrayLen; ++i) {
+                        for (size_t j = 0; j < arrayLen; ++j) {
                             data.resize(data.size() + 4);
-                            *rc<uint32_t*>(&data[data.size() - 4]) = rc<uint32_t*>(arrayData)[i];
+                            uint32_t val = rc<uint32_t*>(arrayData)[j];
+                            std::memcpy(&data[data.size() - 4], &val, sizeof(val));
+                        }
+                        break;
+                    }
+                    case HW_MESSAGE_MAGIC_TYPE_FD: {
+                        for (size_t j = 0; j < arrayLen; ++j) {
+                            fds.emplace_back(rc<int32_t*>(arrayData)[j]);
                         }
                         break;
                     }
@@ -144,21 +168,41 @@ uint32_t IWireObject::call(uint32_t id, ...) {
                 break;
             }
 
+            case HW_MESSAGE_MAGIC_TYPE_FD: {
+                data.emplace_back(HW_MESSAGE_MAGIC_TYPE_FD);
+
+                // add fd to our message
+                fds.emplace_back(va_arg(va, int32_t));
+                break;
+            }
+
             default: break;
         }
     }
 
     data.emplace_back(HW_MESSAGE_MAGIC_END);
 
-    auto msg = CGenericProtocolMessage(std::move(data));
-    sendMessage(msg);
+    auto msg = CGenericProtocolMessage(std::move(data), std::move(fds));
 
-    if (waitOnSeq) {
-        // we are a client
+    if (!m_id && !server()) {
         auto selfClient = reinterpretPointerCast<CClientObject>(m_self.lock());
-        auto obj        = selfClient->m_client->makeObject(m_protocolName, method.returnsType, waitOnSeq);
-        selfClient->m_client->waitForObject(obj);
-        return obj->m_id;
+
+        TRACE(Debug::log(TRACE, "[{} @ {:.3f}] -- call: waiting on object of type {}", selfClient->m_client->m_fd.get(), steadyMillis(), method.returnsType));
+
+        msg.m_dependsOnSeq = m_seq;
+        selfClient->m_client->m_pendingOutgoing.emplace_back(std::move(msg));
+        if (returnSeq) {
+            selfClient->m_client->makeObject(m_protocolName, method.returnsType, returnSeq);
+            return returnSeq;
+        }
+    } else {
+        sendMessage(msg);
+        if (returnSeq) {
+            // we are a client
+            auto selfClient = reinterpretPointerCast<CClientObject>(m_self.lock());
+            selfClient->m_client->makeObject(m_protocolName, method.returnsType, returnSeq);
+            return returnSeq;
+        }
     }
 
     return 0;
@@ -171,49 +215,75 @@ void IWireObject::listen(uint32_t id, void* fn) {
     m_listeners.at(id) = fn;
 }
 
-void IWireObject::called(uint32_t id, const std::span<const uint8_t>& data) {
+void IWireObject::called(uint32_t id, const std::span<const uint8_t>& data, const std::vector<int>& fds) {
     const auto METHODS = methodsIn();
     if (METHODS.size() <= id) {
-        Debug::log(ERR, "core protocol error: invalid method {} for object {}", id, m_id);
-        errd();
+        const auto MSG = std::format("invalid method {} for object {}", id, m_id);
+        Debug::log(ERR, "core protocol error: {}", MSG);
+        error(m_id, MSG);
         return;
     }
 
     if (m_listeners.size() <= id || m_listeners.at(id) == nullptr)
         return;
 
-    const auto& method = METHODS.at(id);
-    const auto  params = method.params;
+    const auto&          method = METHODS.at(id);
+    std::vector<uint8_t> params;
+
+    if (!method.returnsType.empty())
+        params.emplace_back(HW_MESSAGE_MAGIC_TYPE_SEQ);
+
+    params.append_range(method.params);
 
     if (method.since > m_version) {
-        Debug::log(ERR, "core protocol error: method {} since {} but has {}", id, method.since, m_version);
-        errd();
+        const auto MSG = std::format("method {} since {} but has {}", id, method.since, m_version);
+        Debug::log(ERR, "core protocol error: {}", MSG);
+        error(m_id, MSG);
         return;
     }
 
     std::vector<ffi_type*> ffiTypes = {&ffi_type_pointer};
-    if (!method.returnsType.empty())
-        ffiTypes.emplace_back(&ffi_type_uint32);
-    size_t dataI = 0;
+    size_t                 dataI    = 0;
     for (size_t i = 0; i < params.size(); ++i) {
-        const auto PARAM   = sc<eMessageMagic>(params.at(i));
-        auto       ffiType = FFI::ffiTypeFrom(PARAM);
+        const auto PARAM      = sc<eMessageMagic>(params.at(i));
+        const auto WIRE_PARAM = sc<eMessageMagic>(data[dataI]);
+
+        if (PARAM != WIRE_PARAM) {
+            // raise protocol error
+            const auto MSG = std::format("method {} param idx {} should be {} but was {}", id, i, magicToString(PARAM), magicToString(WIRE_PARAM));
+            Debug::log(ERR, "core protocol error: {}", MSG);
+            error(m_id, MSG);
+            return;
+        }
+
+        auto ffiType = FFI::ffiTypeFrom(PARAM);
         ffiTypes.emplace_back(ffiType);
 
         switch (PARAM) {
             case HW_MESSAGE_MAGIC_END: ++i; break; // BUG if this happens or malformed message
+            case HW_MESSAGE_MAGIC_TYPE_FD: dataI++; break;
             case HW_MESSAGE_MAGIC_TYPE_UINT:
             case HW_MESSAGE_MAGIC_TYPE_F32:
             case HW_MESSAGE_MAGIC_TYPE_INT:
             case HW_MESSAGE_MAGIC_TYPE_OBJECT:
-            case HW_MESSAGE_MAGIC_TYPE_SEQ: dataI += 4; break;
+            case HW_MESSAGE_MAGIC_TYPE_SEQ: dataI += 5; break;
             case HW_MESSAGE_MAGIC_TYPE_VARCHAR: {
-                auto [a, b] = g_messageParser->parseVarInt(std::span<const uint8_t>{&data[dataI], data.size() - dataI});
+                auto [a, b] = g_messageParser->parseVarInt(std::span<const uint8_t>{&data[dataI + 1], data.size() - dataI});
                 dataI += a + b + 1;
                 break;
             }
             case HW_MESSAGE_MAGIC_TYPE_ARRAY: {
-                const auto arrType    = sc<eMessageMagic>(params.at(++i));
+                const auto arrType  = sc<eMessageMagic>(params.at(++i));
+                const auto wireType = sc<eMessageMagic>(data[dataI + 1]);
+
+                if (arrType != wireType) {
+                    // raise protocol error
+                    const auto MSG = std::format("method {} param idx {} should be {} but was {}", id, i, magicToString(PARAM), magicToString(WIRE_PARAM));
+                    Debug::log(ERR, "core protocol error: {}", MSG);
+                    error(m_id, MSG);
+                    return;
+                }
+
                 auto [arrLen, lenLen] = g_messageParser->parseVarInt(std::span<const uint8_t>{&data[dataI + 2], data.size() - i});
                 size_t arrMessageLen  = 2 + lenLen;
 
@@ -231,8 +301,9 @@ void IWireObject::called(uint32_t id, const std::span<const uint8_t>& data) {
                     case HW_MESSAGE_MAGIC_TYPE_VARCHAR: {
                         for (size_t j = 0; j < arrLen; ++j) {
                             if (dataI + arrMessageLen > data.size()) {
-                                Debug::log(ERR, "core protocol error: failed demarshaling array message");
-                                errd();
+                                const auto MSG = std::format("failed demarshaling array message");
+                                Debug::log(ERR, "core protocol error: {}", MSG);
+                                error(m_id, MSG);
                                 return;
                             }
                             auto [strLen, strlenLen] = g_messageParser->parseVarInt(std::span<const uint8_t>{&data[dataI + arrMessageLen], data.size() - dataI - arrMessageLen});
@@ -240,9 +311,13 @@ void IWireObject::called(uint32_t id, const std::span<const uint8_t>& data) {
                         }
                         break;
                     }
+                    case HW_MESSAGE_MAGIC_TYPE_FD: {
+                        break;
+                    }
                     default: {
-                        Debug::log(ERR, "core protocol error: failed demarshaling array message");
-                        errd();
+                        const auto MSG = std::format("failed demarshaling array message");
+                        Debug::log(ERR, "core protocol error: {}", MSG);
+                        error(m_id, MSG);
                         return;
                     }
                 }
@@ -251,8 +326,9 @@ void IWireObject::called(uint32_t id, const std::span<const uint8_t>& data) {
                 break;
             }
             case HW_MESSAGE_MAGIC_TYPE_OBJECT_ID: {
-                Debug::log(ERR, "core protocol error: object type is not impld");
-                errd();
+                const auto MSG = std::format("object type is not impld");
+                Debug::log(ERR, "core protocol error: {}", MSG);
+                error(m_id, MSG);
                 return;
             }
         }
@@ -272,6 +348,8 @@ void IWireObject::called(uint32_t id, const std::span<const uint8_t>& data) {
     auto                         ptrBuf = malloc(sizeof(IObject*));
     avalues.emplace_back(ptrBuf);
     *rc<IObject**>(ptrBuf) = m_self.get();
+
+    size_t      fdNo = 0;
 
     CScopeGuard x([&] {
         for (const auto& v : avalues) {
@@ -293,32 +371,32 @@ void IWireObject::called(uint32_t id, const std::span<const uint8_t>& data) {
         switch (PARAM) {
             case HW_MESSAGE_MAGIC_END: break;
             case HW_MESSAGE_MAGIC_TYPE_UINT: {
-                buf                 = malloc(sizeof(uint32_t));
-                *rc<uint32_t*>(buf) = *rc<const uint32_t*>(&data[i + 1]);
+                buf = malloc(sizeof(uint32_t));
+                std::memcpy(buf, &data[i + 1], sizeof(uint32_t));
                 i += 4;
                 break;
             }
             case HW_MESSAGE_MAGIC_TYPE_F32: {
-                buf              = malloc(sizeof(float));
-                *rc<float*>(buf) = *rc<const float*>(&data[i + 1]);
+                buf = malloc(sizeof(float));
+                std::memcpy(buf, &data[i + 1], sizeof(float));
                 i += 4;
                 break;
             }
             case HW_MESSAGE_MAGIC_TYPE_INT: {
-                buf                = malloc(sizeof(int32_t));
-                *rc<int32_t*>(buf) = *rc<const int32_t*>(&data[i + 1]);
+                buf = malloc(sizeof(int32_t));
+                std::memcpy(buf, &data[i + 1], sizeof(int32_t));
                 i += 4;
                 break;
             }
             case HW_MESSAGE_MAGIC_TYPE_OBJECT: {
-                buf                 = malloc(sizeof(uint32_t));
-                *rc<uint32_t*>(buf) = *rc<const uint32_t*>(&data[i + 1]);
+                buf = malloc(sizeof(uint32_t));
+                std::memcpy(buf, &data[i + 1], sizeof(uint32_t));
                 i += 4;
                 break;
             }
             case HW_MESSAGE_MAGIC_TYPE_SEQ: {
-                buf                 = malloc(sizeof(uint32_t));
-                *rc<uint32_t*>(buf) = *rc<const uint32_t*>(&data[i + 1]);
+                buf = malloc(sizeof(uint32_t));
+                std::memcpy(buf, &data[i + 1], sizeof(uint32_t));
                 i += 4;
                 break;
             }
@@ -341,7 +419,7 @@ void IWireObject::called(uint32_t id, const std::span<const uint8_t>& data) {
                     case HW_MESSAGE_MAGIC_TYPE_INT:
                     case HW_MESSAGE_MAGIC_TYPE_OBJECT:
                     case HW_MESSAGE_MAGIC_TYPE_SEQ: {
-                        auto dataPtr  = rc<uint32_t*>(malloc(sizeof(uint32_t) * arrLen));
+                        auto dataPtr  = rc<uint32_t*>(malloc(sizeof(uint32_t) * (arrLen == 0 ? 1 : arrLen)));
                         auto dataSlot = rc<uint32_t**>(malloc(sizeof(uint32_t**)));
                         auto sizeSlot = rc<uint32_t*>(malloc(sizeof(uint32_t)));
 
@@ -353,13 +431,13 @@ void IWireObject::called(uint32_t id, const std::span<const uint8_t>& data) {
                         otherBuffers.emplace_back(dataPtr);
 
                         for (size_t j = 0; j < arrLen; ++j) {
-                            dataPtr[j] = *rc<const uint32_t*>(&data[i + arrMessageLen]);
+                            std::memcpy(&dataPtr[j], &data[i + arrMessageLen], sizeof(uint32_t));
                             arrMessageLen += 4;
                         }
                         break;
                     }
                     case HW_MESSAGE_MAGIC_TYPE_VARCHAR: {
-                        auto dataPtr  = rc<const char**>(malloc(sizeof(const char*) * arrLen));
+                        auto dataPtr  = rc<const char**>(malloc(sizeof(const char*) * (arrLen == 0 ? 1 : arrLen)));
                         auto dataSlot = rc<const char***>(malloc(sizeof(const char***)));
                         auto sizeSlot = rc<uint32_t*>(malloc(sizeof(uint32_t)));
 
@@ -378,9 +456,28 @@ void IWireObject::called(uint32_t id, const std::span<const uint8_t>& data) {
                         }
                         break;
                     }
+                    case HW_MESSAGE_MAGIC_TYPE_FD: {
+                        auto dataPtr  = rc<int32_t*>(malloc(sizeof(int32_t) * (arrLen == 0 ? 1 : arrLen)));
+                        auto dataSlot = rc<int32_t**>(malloc(sizeof(int32_t**)));
+                        auto sizeSlot = rc<uint32_t*>(malloc(sizeof(uint32_t)));
+
+                        *dataSlot = dataPtr;
+                        *sizeSlot = arrLen;
+
+                        avalues.emplace_back(dataSlot);
+                        avalues.emplace_back(sizeSlot);
+                        otherBuffers.emplace_back(dataPtr);
+
+                        for (size_t j = 0; j < arrLen; ++j) {
+                            dataPtr[j] = fds.at(fdNo++);
+                        }
+
+                        break;
+                    }
                     default: {
-                        Debug::log(ERR, "core protocol error: failed demarshaling array message");
-                        errd();
+                        const auto MSG = std::format("failed demarshaling array message");
+                        Debug::log(ERR, "core protocol error: {}", MSG);
+                        error(m_id, MSG);
                         return;
                     }
                 }
@@ -389,12 +486,19 @@ void IWireObject::called(uint32_t id, const std::span<const uint8_t>& data) {
                 break;
             }
             case HW_MESSAGE_MAGIC_TYPE_OBJECT_ID: {
-                Debug::log(ERR, "core protocol error: object type is not impld");
-                errd();
+                const auto MSG = std::format("object type is not impld");
+                Debug::log(ERR, "core protocol error: {}", MSG);
+                error(m_id, MSG);
                 return;
             }
+            case HW_MESSAGE_MAGIC_TYPE_FD: {
+                buf                = malloc(sizeof(int32_t));
+                *rc<int32_t*>(buf) = fds.at(fdNo++);
+                break;
+            }
         }
-        avalues.emplace_back(buf);
+        if (buf)
+            avalues.emplace_back(buf);
     }
 
     auto fptr = reinterpret_cast<void (*)()>(m_listeners.at(id));
