@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <ranges>
 #include <algorithm>
+#include <string_view>
 
 #include <pugixml.hpp>
 
@@ -95,6 +96,8 @@ static Hyprwire::eMessageMagic strToMagic(const std::string_view& sv) {
         return Hyprwire::HW_MESSAGE_MAGIC_TYPE_INT;
     if (sv == "f32")
         return Hyprwire::HW_MESSAGE_MAGIC_TYPE_F32;
+    if (sv == "fd")
+        return Hyprwire::HW_MESSAGE_MAGIC_TYPE_FD;
     // if (sv == "object")
     //     return Hyprwire::HW_MESSAGE_MAGIC_TYPE_OBJECT_ID;
     if (sv.starts_with("array "))
@@ -108,6 +111,7 @@ static std::string magicToString(Hyprwire::eMessageMagic m, Hyprwire::eMessageMa
         case Hyprwire::HW_MESSAGE_MAGIC_TYPE_UINT: return "Hyprwire::HW_MESSAGE_MAGIC_TYPE_UINT";
         case Hyprwire::HW_MESSAGE_MAGIC_TYPE_INT: return "Hyprwire::HW_MESSAGE_MAGIC_TYPE_INT";
         case Hyprwire::HW_MESSAGE_MAGIC_TYPE_F32: return "Hyprwire::HW_MESSAGE_MAGIC_TYPE_F32";
+        case Hyprwire::HW_MESSAGE_MAGIC_TYPE_FD: return "Hyprwire::HW_MESSAGE_MAGIC_TYPE_FD";
         case Hyprwire::HW_MESSAGE_MAGIC_TYPE_ARRAY: return "Hyprwire::HW_MESSAGE_MAGIC_TYPE_ARRAY, " + magicToString(arrType);
         default: return "";
     }
@@ -119,6 +123,7 @@ static std::string argToC(Hyprwire::eMessageMagic m) {
         case Hyprwire::HW_MESSAGE_MAGIC_TYPE_UINT: return "uint32_t";
         case Hyprwire::HW_MESSAGE_MAGIC_TYPE_INT: return "int32_t";
         case Hyprwire::HW_MESSAGE_MAGIC_TYPE_F32: return "float";
+        case Hyprwire::HW_MESSAGE_MAGIC_TYPE_FD: return "int";
         default: return "";
     }
 }
@@ -134,7 +139,8 @@ static std::string argToC(const SRequestArgument& arg) {
         }
         case Hyprwire::HW_MESSAGE_MAGIC_TYPE_INT: return "int32_t";
         case Hyprwire::HW_MESSAGE_MAGIC_TYPE_F32: return "float";
-        case Hyprwire::HW_MESSAGE_MAGIC_TYPE_ARRAY: return "std::vector<" + argToC(arg.arrType) + ">";
+        case Hyprwire::HW_MESSAGE_MAGIC_TYPE_FD: return "int";
+        case Hyprwire::HW_MESSAGE_MAGIC_TYPE_ARRAY: return "const std::vector<" + argToC(arg.arrType) + ">&";
         default: return "";
     }
 }
@@ -374,7 +380,7 @@ Hyprwire::SMethod{{
 
             std::string argArrayStr;
             for (const auto& p : m.args) {
-                argArrayStr += magicToString(p.magic) + ", ";
+                argArrayStr += magicToString(p.magic, p.arrType) + ", ";
             }
 
             if (!argArrayStr.empty())
@@ -568,8 +574,8 @@ void CC{}Object::send{}({}) {{
                 SOURCE += std::format(R"#(
 
 SP<Hyprwire::IObject> CC{}Object::send{}({}) {{
-    auto id = m_object->call({}{});
-    return m_object->clientSock()->objectForId(id);
+    auto _seq = m_object->call({}{});
+    return m_object->clientSock()->objectForSeq(_seq);
 }}
 )#",
                                       capitalize(o.nameCamel), capitalize(camelize(m.name)), argsToC(m.args), m.idx,
@@ -647,8 +653,11 @@ class C{}Object {{
         m_object->error(code, sv);
     }}
 
+    static const char* name() {{
+        return "{}";
+    }}
 )#",
-                                   capitalize(o.nameCamel), capitalize(o.nameCamel), capitalize(o.nameCamel));
+                                   capitalize(o.nameCamel), capitalize(o.nameCamel), capitalize(o.nameCamel), o.name);
 
         for (const auto& m : o.s2c) {
             HEADER_IMPL += std::format(R"#(

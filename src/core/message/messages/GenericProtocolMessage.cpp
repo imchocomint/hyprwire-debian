@@ -4,12 +4,13 @@
 #include "../../../helpers/Env.hpp"
 #include "../../../helpers/Log.hpp"
 
+#include <cstring>
 #include <stdexcept>
 #include <hyprwire/core/types/MessageMagic.hpp>
 
 using namespace Hyprwire;
 
-CGenericProtocolMessage::CGenericProtocolMessage(const std::vector<uint8_t>& data, size_t offset) {
+CGenericProtocolMessage::CGenericProtocolMessage(const std::vector<uint8_t>& data, std::vector<int>& fds, size_t offset) {
     m_type = HW_MESSAGE_TYPE_GENERIC_PROTOCOL_MESSAGE;
 
     try {
@@ -19,12 +20,12 @@ CGenericProtocolMessage::CGenericProtocolMessage(const std::vector<uint8_t>& dat
         if (data.at(offset + 1) != HW_MESSAGE_MAGIC_TYPE_OBJECT)
             return;
 
-        m_object = *rc<const uint32_t*>(&data.at(offset + 2));
+        std::memcpy(&m_object, &data.at(offset + 2), sizeof(m_object));
 
         if (data.at(offset + 6) != HW_MESSAGE_MAGIC_TYPE_UINT)
             return;
 
-        m_method = *rc<const uint32_t*>(&data.at(offset + 7));
+        std::memcpy(&m_method, &data.at(offset + 7), sizeof(m_method));
 
         size_t i = 11;
         while (data.at(offset + i) != HW_MESSAGE_MAGIC_END) {
@@ -61,6 +62,18 @@ CGenericProtocolMessage::CGenericProtocolMessage(const std::vector<uint8_t>& dat
                             }
                             break;
                         }
+                        case HW_MESSAGE_MAGIC_TYPE_FD: {
+                            for (size_t j = 0; j < arrLen; ++j) {
+                                if (fds.empty())
+                                    return;
+
+                                m_fds.emplace_back(fds[0]);
+                                fds.erase(fds.begin(), fds.begin() + 1);
+                            }
+
+                            i += 0;
+                            break;
+                        }
                         default: {
                             Debug::log(TRACE, "GenericProtocolMessage: failed demarshaling array message");
                             return;
@@ -68,6 +81,18 @@ CGenericProtocolMessage::CGenericProtocolMessage(const std::vector<uint8_t>& dat
                     }
 
                     i += arrMessageLen;
+                    break;
+                }
+                case HW_MESSAGE_MAGIC_TYPE_FD: {
+                    if (fds.empty()) {
+                        Debug::log(TRACE, "GenericProtocolMessage: HW_MESSAGE_MAGIC_TYPE_FD but fd queue is empty");
+                        return;
+                    }
+
+                    m_fds.emplace_back(fds[0]);
+                    fds.erase(fds.begin(), fds.begin() + 1);
+
+                    i += 1;
                     break;
                 }
                 default: {
@@ -79,7 +104,7 @@ CGenericProtocolMessage::CGenericProtocolMessage(const std::vector<uint8_t>& dat
 
         m_len = i + 1;
 
-        m_dataSpan = std::span<const uint8_t>{data.begin() + 11 + offset, m_len};
+        m_dataSpan = std::span<const uint8_t>{data.begin() + 11 + offset, m_len - 11};
 
         if (Env::isTrace())
             m_data = std::vector<uint8_t>{data.begin() + offset, data.begin() + offset + m_len - 1};
@@ -87,7 +112,17 @@ CGenericProtocolMessage::CGenericProtocolMessage(const std::vector<uint8_t>& dat
     } catch (std::out_of_range& e) { m_len = 0; }
 }
 
-CGenericProtocolMessage::CGenericProtocolMessage(std::vector<uint8_t>&& data) {
+CGenericProtocolMessage::CGenericProtocolMessage(std::vector<uint8_t>&& data, std::vector<int>&& fds) : m_fds(std::move(fds)) {
     m_data = std::move(data);
     m_type = HW_MESSAGE_TYPE_GENERIC_PROTOCOL_MESSAGE;
+}
+
+const std::vector<int>& CGenericProtocolMessage::fds() const {
+    return m_fds;
+}
+
+void CGenericProtocolMessage::resolveSeq(uint32_t id) {
+    m_object = id;
+    if (m_data.size() > 2)
+        m_data[2] = id;
 }

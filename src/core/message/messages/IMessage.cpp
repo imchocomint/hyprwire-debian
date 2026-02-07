@@ -2,6 +2,7 @@
 #include "../MessageParser.hpp"
 #include "../../../helpers/Memory.hpp"
 
+#include <cstring>
 #include <format>
 #include <string_view>
 
@@ -12,16 +13,34 @@ using namespace Hyprwire;
 static std::pair<std::string, size_t> formatPrimitiveType(const std::span<const uint8_t>& s, eMessageMagic type) {
     switch (type) {
         case HW_MESSAGE_MAGIC_TYPE_UINT: {
-            return {std::format("{}", *rc<const uint32_t*>(&s[0])), 4};
+            if (s.size() < 4)
+                return {"", 0};
+            uint32_t val = 0;
+            std::memcpy(&val, &s[0], sizeof(val));
+            return {std::format("{}", val), 4};
         }
         case HW_MESSAGE_MAGIC_TYPE_INT: {
-            return {std::format("{}", *rc<const int32_t*>(&s[0])), 4};
+            if (s.size() < 4)
+                return {"", 0};
+            int32_t val = 0;
+            std::memcpy(&val, &s[0], sizeof(val));
+            return {std::format("{}", val), 4};
         }
         case HW_MESSAGE_MAGIC_TYPE_F32: {
-            return {std::format("{}", *rc<const float*>(&s[0])), 4};
+            if (s.size() < 4)
+                return {"", 0};
+            float val = 0;
+            std::memcpy(&val, &s[0], sizeof(val));
+            return {std::format("{}", val), 4};
+        }
+        case HW_MESSAGE_MAGIC_TYPE_FD: {
+            return {"<fd>", 0};
         }
         case HW_MESSAGE_MAGIC_TYPE_OBJECT: {
-            auto id = *rc<const uint32_t*>(&s[0]);
+            if (s.size() < 4)
+                return {"", 0};
+            uint32_t id = 0;
+            std::memcpy(&id, &s[0], sizeof(id));
             return {std::format("object: {}", id == 0 ? "null" : std::to_string(id)), 4};
         }
         case HW_MESSAGE_MAGIC_TYPE_VARCHAR: {
@@ -29,6 +48,7 @@ static std::pair<std::string, size_t> formatPrimitiveType(const std::span<const 
             auto ptr           = rc<const char*>(&s[intLen]);
             return {std::format("\"{}\"", std::string_view{ptr, len}), len + intLen};
         }
+        default: break;
     }
 
     return {"", 0};
@@ -46,29 +66,48 @@ std::string IMessage::parseData() const {
                 break;
             }
             case HW_MESSAGE_MAGIC_TYPE_SEQ: {
-                result += std::format("seq: {}", *rc<const uint32_t*>(&m_data.at(needle)));
-                needle += 4;
+                int32_t seq = 0;
+                if (m_data.size() - needle >= 4) {
+                    std::memcpy(&seq, &m_data.at(needle), 4);
+                    result += std::format("seq: {}", seq);
+                    needle += 4;
+                }
                 break;
             }
             case HW_MESSAGE_MAGIC_TYPE_UINT: {
-                result += std::format("{}", *rc<const uint32_t*>(&m_data.at(needle)));
-                needle += 4;
+                uint32_t val = 0;
+                if (m_data.size() - needle >= 4) {
+                    std::memcpy(&val, &m_data.at(needle), 4);
+                    result += std::format("{}", val);
+                    needle += 4;
+                }
                 break;
             }
             case HW_MESSAGE_MAGIC_TYPE_INT: {
-                result += std::format("{}", *rc<const int32_t*>(&m_data.at(needle)));
-                needle += 4;
+                int32_t val = 0;
+                if (m_data.size() - needle >= 4) {
+                    std::memcpy(&val, &m_data.at(needle), 4);
+                    result += std::format("{}", val);
+                    needle += 4;
+                }
                 break;
             }
             case HW_MESSAGE_MAGIC_TYPE_F32: {
-                result += std::format("{}", *rc<const float*>(&m_data.at(needle)));
-                needle += 4;
+                float val = 0;
+                if (m_data.size() - needle >= 4) {
+                    std::memcpy(&val, &m_data.at(needle), 4);
+                    result += std::format("{}", val);
+                    needle += 4;
+                }
                 break;
             }
             case HW_MESSAGE_MAGIC_TYPE_VARCHAR: {
                 auto [len, intLen] = g_messageParser->parseVarInt(m_data, needle);
-                auto ptr           = rc<const char*>(&m_data.at(needle + intLen));
-                result += std::format("\"{}\"", std::string_view{ptr, len});
+                if (len > 0) {
+                    auto ptr = rc<const char*>(&m_data.at(needle + intLen));
+                    result += std::format("\"{}\"", std::string_view{ptr, len});
+                } else
+                    result += "\"\"";
                 needle += intLen + len;
                 break;
             }
@@ -79,7 +118,7 @@ std::string IMessage::parseData() const {
                 needle += intLen;
 
                 for (size_t i = 0; i < els; ++i) {
-                    auto [str, len] = formatPrimitiveType(std::span<const uint8_t>{&m_data[needle], m_data.size() - needle}, thisType);
+                    auto [str, len] = formatPrimitiveType(std::span<const uint8_t>{m_data.data() + (needle * sizeof(uint8_t)), m_data.size() - needle}, thisType);
 
                     needle += len;
 
@@ -94,11 +133,19 @@ std::string IMessage::parseData() const {
                 break;
             }
             case HW_MESSAGE_MAGIC_TYPE_OBJECT: {
-                auto id = *rc<const uint32_t*>(&m_data.at(needle));
-                needle += 4;
-                result += std::format("object({})", id);
+                uint32_t id = 0;
+                if (m_data.size() - needle >= 4) {
+                    std::memcpy(&id, &m_data.at(needle), 4);
+                    needle += 4;
+                    result += std::format("object({})", id);
+                }
                 break;
             }
+            case HW_MESSAGE_MAGIC_TYPE_FD: {
+                result += "<fd>";
+                break;
+            }
+            default: break;
         }
 
         result += ", ";
@@ -115,4 +162,9 @@ std::string IMessage::parseData() const {
 
     result += " ) ";
     return result;
+}
+
+const std::vector<int>& IMessage::fds() const {
+    static const std::vector<int> emptyVec;
+    return emptyVec;
 }

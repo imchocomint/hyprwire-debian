@@ -17,15 +17,23 @@ namespace Hyprwire {
         CServerClient(int fd);
         virtual ~CServerClient();
 
+        virtual int                    getPID();
+
         void                           sendMessage(const IMessage& message);
         SP<CServerObject>              createObject(const std::string& protocol, const std::string& object, uint32_t version, uint32_t seq);
         void                           onBind(SP<CServerObject> obj);
         void                           onGeneric(const CGenericProtocolMessage& msg);
+        void                           dispatchFirstPoll();
 
         Hyprutils::OS::CFileDescriptor m_fd;
 
+        int                            m_pid           = -1;
+        bool                           m_firstPollDone = false;
+
         uint32_t                       m_version = 0, m_maxId = 1;
         bool                           m_error = false;
+
+        uint32_t                       m_scheduledRoundtripSeq = 0;
 
         std::vector<SP<CServerObject>> m_objects;
 

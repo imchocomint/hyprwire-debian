@@ -5,10 +5,16 @@
 #include "../../helpers/Log.hpp"
 #include "../../Macros.hpp"
 #include "../message/MessageParser.hpp"
+#include "../message/messages/FatalProtocolError.hpp"
+#include "../message/messages/RoundtripDone.hpp"
+#include "../socket/SocketHelpers.hpp"
 
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <netinet/in.h>
+#include <cstring>
+#include <cerrno>
+#include <unistd.h>
 
 #include <filesystem>
 #include <hyprutils/utils/ScopeGuard.hpp>
@@ -19,20 +25,53 @@ using namespace Hyprutils::Utils;
 
 SP<IServerSocket> IServerSocket::open(const std::string& path) {
     SP<CServerSocket> sock = makeShared<CServerSocket>();
+    sock->m_self           = sock;
+
     if (!sock->attempt(path))
         return nullptr;
-    sock->m_self = sock;
+
     return sock;
 }
 
+SP<IServerSocket> IServerSocket::open() {
+    SP<CServerSocket> sock = makeShared<CServerSocket>();
+    sock->m_self           = sock;
+
+    if (!sock->attemptEmpty())
+        return nullptr;
+
+    return sock;
+}
+
+CServerSocket::CServerSocket() {
+    int pipes[2];
+    if (pipe(pipes) < 0)
+        Debug::log(ERR, "[- @ {:.3f}] Open wakeup pipes: {}", steadyMillis(), strerror(errno));
+
+    else {
+        m_wakeupFd      = CFileDescriptor{pipes[0]};
+        m_wakeupWriteFd = CFileDescriptor{pipes[1]};
+
+        m_wakeupWriteFd.setFlags(O_CLOEXEC);
+        m_wakeupFd.setFlags(O_CLOEXEC);
+    }
+}
+
 CServerSocket::~CServerSocket() {
-    if (!m_success)
-        return;
+    if (m_pollThread.joinable()) {
+        m_threadCanPoll = false;
+        m_pollEvent     = false;
+        sc<void>(write(m_exitWriteFd.get(), "x", 1));
+        m_pollEventHandledCV.notify_all();
+        m_pollThread.join();
+    }
 
     m_fd.reset();
 
-    std::error_code ec;
-    std::filesystem::remove(m_path, ec);
+    if (!m_path.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(m_path, ec);
+    }
 }
 
 bool CServerSocket::attempt(const std::string& path) {
@@ -82,10 +121,16 @@ bool CServerSocket::attempt(const std::string& path) {
 
     listen(m_fd.get(), 100);
 
-    m_fd.setFlags(O_NONBLOCK);
+    m_fd.setFlags(O_NONBLOCK | O_CLOEXEC);
+    m_path = path;
 
-    m_success = true;
-    m_path    = path;
+    recheckPollFds();
+
+    return true;
+}
+
+bool CServerSocket::attemptEmpty() {
+    m_isEmptyListener = true;
 
     recheckPollFds();
 
@@ -114,6 +159,7 @@ bool CServerSocket::dispatchEvents(bool block) {
 
     // read from our event fd to avoid events
     clearEventFd();
+    clearWakeupFd();
 
     if (block) {
         poll(m_pollfds.data(), m_pollfds.size(), -1);
@@ -124,22 +170,26 @@ bool CServerSocket::dispatchEvents(bool block) {
 
     m_pollmtx.unlock();
 
+    std::unique_lock lk(m_exportPollMtx);
+    m_pollEvent = false;
+    m_pollEventHandledCV.notify_all();
+
     return true;
 }
 
-void CServerSocket::clearEventFd() {
+void CServerSocket::clearFd(const Hyprutils::OS::CFileDescriptor& fd) {
     char   buf[128];
     pollfd pfd = {
-        .fd     = m_exportFd.get(),
+        .fd     = fd.get(),
         .events = POLLIN,
 
     };
 
-    while (m_exportFd.isValid()) {
+    while (fd.isValid()) {
         poll(&pfd, 1, 0);
 
         if (pfd.revents & POLLIN) {
-            read(m_exportFd.get(), buf, 127);
+            sc<void>(read(fd.get(), buf, 127));
             continue;
         }
 
@@ -147,18 +197,62 @@ void CServerSocket::clearEventFd() {
     }
 }
 
-constexpr const size_t INTERNAL_FDS = 2;
+void CServerSocket::clearEventFd() {
+    clearFd(m_exportFd);
+}
+
+void CServerSocket::clearWakeupFd() {
+    clearFd(m_wakeupFd);
+}
+
+SP<IServerClient> CServerSocket::addClient(int fd) {
+    auto x = makeShared<CServerClient>(fd);
+    if (x->m_fd.isClosed() || !x->m_fd.isValid())
+        return nullptr;
+
+    x->m_self   = x;
+    x->m_server = m_self;
+    m_clients.emplace_back(x);
+
+    recheckPollFds();
+
+    // wake up any poller
+    sc<void>(write(m_wakeupWriteFd.get(), "x", 1));
+
+    return x;
+}
+
+bool CServerSocket::removeClient(int fd) {
+    auto r = std::erase_if(m_clients, [&fd](const auto& c) { return c->m_fd.get() == fd; });
+
+    if (r > 0)
+        recheckPollFds();
+
+    return r > 0;
+}
+
+size_t CServerSocket::internalFds() {
+    return m_isEmptyListener ? 2 : 3;
+}
 
 //
 void CServerSocket::recheckPollFds() {
     m_pollfds.clear();
+
+    if (!m_isEmptyListener) {
+        m_pollfds.emplace_back(pollfd{
+            .fd     = m_fd.get(),
+            .events = POLLIN,
+        });
+    }
+
     m_pollfds.emplace_back(pollfd{
-        .fd     = m_fd.get(),
+        .fd     = m_exitFd.get(),
         .events = POLLIN,
     });
 
     m_pollfds.emplace_back(pollfd{
-        .fd     = m_exitFd.get(),
+        .fd     = m_wakeupFd.get(),
         .events = POLLIN,
     });
 
@@ -171,6 +265,9 @@ void CServerSocket::recheckPollFds() {
 }
 
 bool CServerSocket::dispatchNewConnections() {
+    if (m_isEmptyListener)
+        return false;
+
     if (!(m_pollfds.at(0).revents & POLLIN))
         return false;
 
@@ -190,23 +287,23 @@ bool CServerSocket::dispatchExistingConnections() {
     bool hadAny           = false;
     bool needsPollRecheck = false;
 
-    for (size_t i = INTERNAL_FDS; i < m_pollfds.size(); ++i) {
+    for (size_t i = internalFds(); i < m_pollfds.size(); ++i) {
         if (!(m_pollfds.at(i).revents & POLLIN))
             continue;
 
-        dispatchClient(m_clients.at(i - INTERNAL_FDS));
+        dispatchClient(m_clients.at(i - internalFds()));
 
         hadAny = true;
 
         if (m_pollfds.at(i).revents & POLLHUP) {
-            m_clients.at(i - INTERNAL_FDS)->m_error = true;
-            needsPollRecheck                        = true;
-            TRACE(Debug::log(TRACE, "[{} @ {:.3f}] Dropping client (hangup)", m_clients.at(i - INTERNAL_FDS)->m_fd.get(), steadyMillis()));
+            m_clients.at(i - internalFds())->m_error = true;
+            needsPollRecheck                         = true;
+            TRACE(Debug::log(TRACE, "[{} @ {:.3f}] Dropping client (hangup)", m_clients.at(i - internalFds())->m_fd.get(), steadyMillis()));
             continue;
         }
 
-        if (m_clients.at(i - INTERNAL_FDS)->m_error)
-            TRACE(Debug::log(TRACE, "[{} @ {:.3f}] Dropping client (protocol error)", m_clients.at(i - INTERNAL_FDS)->m_fd.get(), steadyMillis()));
+        if (m_clients.at(i - internalFds())->m_error)
+            TRACE(Debug::log(TRACE, "[{} @ {:.3f}] Dropping client (protocol error)", m_clients.at(i - internalFds())->m_fd.get(), steadyMillis()));
     }
 
     if (needsPollRecheck) {
@@ -218,40 +315,55 @@ bool CServerSocket::dispatchExistingConnections() {
 }
 
 void CServerSocket::dispatchClient(SP<CServerClient> client) {
-    std::vector<uint8_t> data;
-    constexpr size_t     BUFFER_SIZE         = 8192;
-    uint8_t              buffer[BUFFER_SIZE] = {0};
+    auto data = parseFromFd(client->m_fd);
 
-    ssize_t              sizeWritten = read(client->m_fd.get(), buffer, BUFFER_SIZE);
-
-    if (sizeWritten <= 0)
+    if (data.bad) {
+        client->sendMessage(CFatalErrorMessage(nullptr, -1, "fatal: invalid message on wire"));
+        client->m_error = true;
         return;
-
-    data.append_range(std::span<uint8_t>(buffer, sizeWritten));
-
-    while (sizeWritten == BUFFER_SIZE) {
-        sizeWritten = read(client->m_fd.get(), buffer, BUFFER_SIZE);
-        if (sizeWritten < 0)
-            return;
-
-        data.append_range(std::span<uint8_t>(buffer, sizeWritten));
     }
 
-    g_messageParser->handleMessage(data, client);
+    if (data.data.empty()) // this should NOT happen
+        return;
+
+    const auto RET = g_messageParser->handleMessage(data, client);
+
+    if (RET != MESSAGE_PARSED_OK) {
+        client->sendMessage(CFatalErrorMessage(nullptr, -1, "fatal: failed to handle message on wire"));
+        client->m_error = true;
+        return;
+    }
+
+    if (client->m_scheduledRoundtripSeq > 0) {
+        client->sendMessage(CRoundtripDoneMessage{client->m_scheduledRoundtripSeq});
+        client->m_scheduledRoundtripSeq = 0;
+    }
 }
 
 int CServerSocket::extractLoopFD() {
     if (!m_exportFd.isValid()) {
         int pipes[2];
-        pipe(pipes);
+        if (pipe(pipes) < 0) {
+            Debug::log(ERR, "[- @ {:.3f}] Failed to export pipes for poll thread: {}", steadyMillis(), strerror(errno));
+            return -1;
+        }
 
         m_exportFd      = CFileDescriptor{pipes[0]};
         m_exportWriteFd = CFileDescriptor{pipes[1]};
 
-        pipe(pipes);
+        m_exportFd.setFlags(O_CLOEXEC);
+        m_exportWriteFd.setFlags(O_CLOEXEC);
+
+        if (pipe(pipes) < 0) {
+            Debug::log(ERR, "[- @ {:.3f}] Failed to exit pipes for poll thread: {}", steadyMillis(), strerror(errno));
+            return -1;
+        }
 
         m_exitFd      = CFileDescriptor{pipes[0]};
         m_exitWriteFd = CFileDescriptor{pipes[1]};
+
+        m_exitFd.setFlags(O_CLOEXEC);
+        m_exitWriteFd.setFlags(O_CLOEXEC);
 
         m_threadCanPoll = true;
 
@@ -262,8 +374,20 @@ int CServerSocket::extractLoopFD() {
                 m_pollmtx.lock();
 
                 std::vector<pollfd> pollfds;
+                if (!m_isEmptyListener) {
+                    pollfds.emplace_back(pollfd{
+                        .fd     = m_fd.get(),
+                        .events = POLLIN,
+                    });
+                }
+
                 pollfds.emplace_back(pollfd{
-                    .fd     = m_fd.get(),
+                    .fd     = m_exitFd.get(),
+                    .events = POLLIN,
+                });
+
+                pollfds.emplace_back(pollfd{
+                    .fd     = m_wakeupFd.get(),
                     .events = POLLIN,
                 });
 
@@ -275,9 +399,20 @@ int CServerSocket::extractLoopFD() {
                 }
 
                 m_pollmtx.unlock();
+
                 poll(pollfds.data(), pollfds.size(), -1);
 
-                write(m_exportWriteFd.get(), "x", 1);
+                if (!m_threadCanPoll)
+                    return;
+
+                {
+                    std::unique_lock lk(m_exportPollMtx);
+
+                    m_pollEvent = true;
+                    sc<void>(write(m_exportWriteFd.get(), "x", 1));
+
+                    m_pollEventHandledCV.wait_for(lk, std::chrono::milliseconds(5000), [this] { return !m_pollEvent; });
+                }
             }
         });
     }
